@@ -1,20 +1,20 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os
-import sys
 import json
-import time
 import logging
-import schedule
-import pika
-import mysql.connector
-from mysql.connector import pooling
-import requests
-import queue
-from datetime import datetime, timedelta
-from threading import Thread, Lock, Event
+import sys
+import time
 from collections import defaultdict
+from datetime import datetime
+from threading import Thread, Lock, Event
+
+import mysql.connector
+import pika
+import redis
+import requests
+import schedule
+from mysql.connector import pooling
+from snowflake import SnowflakeGenerator
 
 # 配置日志
 logging.basicConfig(
@@ -30,24 +30,32 @@ logger = logging.getLogger(__name__)
 # 配置
 CONFIG = {
     'rabbitmq': {
-        'host': 'localhost',
+        'host': '192.168.1.204',
         'port': 5672,
         'virtual_host': '/',
-        'username': 'guest',
-        'password': 'guest',
+        'username': 'zxtf',
+        'password': 'zxtf123',
         'queue': 'hotel_checkin_queue'
     },
     'mysql': {
-        'host': 'localhost',
+        'host': '192.168.1.204',
         'port': 3306,
         'user': 'root',
-        'password': 'password',
-        'database': 'hotel_monitoring',
+        'password': 'root',
+        'database': 'zxtf_saas_test',
         'pool_name': 'hotel_monitoring_pool',
         'pool_size': 10  # 连接池大小
     },
+    'redis': {
+        'host': '192.168.1.204',  # Redis服务器地址，需要根据实际情况修改
+        'port': 6379,            # Redis端口
+        'db': 0,                 # 使用的数据库编号
+        'password': 123456,        # Redis密码，如果有的话
+        'key_prefix': 'hotel_monitoring:', # Redis键前缀
+        'expire_time': 86400 * 7 # 键过期时间，默认7天
+    },
     'feishu': {
-        'webhook_url': 'https://open.feishu.cn/open-apis/bot/v2/hook/your_webhook_token'
+        'webhook_url': 'https://open.feishu.cn/open-apis/bot/v2/hook/1f35ca70-1c95-43f4-a253-6d4eed59818e'
     },
     'monitoring': {
         'check_interval_minutes': 30,
@@ -80,7 +88,10 @@ stop_event = Event()
 MSG_TYPE_CHECKIN = 'checkin'   # 入住消息
 MSG_TYPE_CHECKOUT = 'checkout' # 离店消息
 
-# 创建MySQL连接池
+# 全局连接池
+mysql_pool = None
+redis_conn = None
+
 def create_mysql_pool():
     """创建MySQL连接池"""
     try:
@@ -100,9 +111,6 @@ def create_mysql_pool():
     except Exception as e:
         logger.error(f"创建MySQL连接池失败: {str(e)}")
         return None
-
-# 全局连接池
-mysql_pool = None
 
 def get_db_connection():
     """从连接池获取数据库连接"""
@@ -163,18 +171,18 @@ def send_feishu_notification(message):
         logger.error(f"飞书通知发送异常: {str(e)}")
         return False
 
-def find_closest_electricity_reading(db, hotel_id, room_number, reference_time):
+def find_closest_electricity_reading(db, room_number, reference_time):
     """查找与参考时间最接近的电表读数"""
     try:
         cursor = db.cursor(dictionary=True)
         query = """
-        SELECT id, reading_value, script_time 
+        SELECT id, value as reading_value, gmt_modified as script_time 
         FROM smart_meter 
-        WHERE hotel_id = %s AND room_number = %s 
-        ORDER BY ABS(TIMESTAMPDIFF(SECOND, script_time, %s)) 
+        WHERE room_num = %s 
+        ORDER BY ABS(TIMESTAMPDIFF(SECOND, gmt_modified, %s)) 
         LIMIT 1
         """
-        cursor.execute(query, (hotel_id, room_number, reference_time))
+        cursor.execute(query, (room_number, reference_time))
         result = cursor.fetchone()
         cursor.close()
         return result
@@ -198,15 +206,15 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
             logger.error("初始化房间监控失败: 无法连接数据库")
             return False
             
-        # 查询最接近参考时间的用电量记录
-        result = find_closest_electricity_reading(db, hotel_id, room_number, reference_time)
+        # 查询最接近参考时间的用电量记录，只传递room_number参数
+        result = find_closest_electricity_reading(db, room_number, reference_time)
         
         if result:
             initial_reading = float(result['reading_value'])
             timestamp = result['script_time']
             
-            # 生成房间唯一键，加入消息类型区分不同监控
-            room_key = f"{hotel_id}_{room_number}_{msg_type}"
+            # 生成房间唯一键，不再使用hotel_id，仅使用房间号和消息类型区分不同监控
+            room_key = f"{room_number}_{msg_type}"
             
             # 获取适用的阈值
             if msg_type == MSG_TYPE_CHECKIN:
@@ -214,22 +222,28 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
             else:  # MSG_TYPE_CHECKOUT
                 threshold = CONFIG['monitoring']['checkout_abnormal_threshold']
             
-            # 使用线程锁保护共享状态
-            with room_state_lock:
-                # 存储初始状态
-                room_monitoring_state[room_key] = {
-                    'hotel_id': hotel_id,
-                    'room_number': room_number,
-                    'reference_time': reference_time,
-                    'end_time': end_time,
-                    'initial_reading': initial_reading,
-                    'last_reading': initial_reading,
-                    'last_check_time': timestamp,
-                    'abnormal_count': 0,
-                    'readings_history': [],
-                    'msg_type': msg_type,
-                    'threshold': threshold
-                }
+            # 创建状态数据
+            state_data = {
+                'hotel_id': hotel_id,
+                'room_number': room_number,
+                'reference_time': reference_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(reference_time, datetime) else reference_time,
+                'end_time': end_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(end_time, datetime) else end_time,
+                'initial_reading': initial_reading,
+                'last_reading': initial_reading,
+                'last_check_time': timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(timestamp, datetime) else timestamp,
+                'abnormal_count': 0,
+                'readings_history': [],
+                'msg_type': msg_type,
+                'threshold': threshold
+            }
+            
+            # 保存到Redis
+            if not save_state_to_redis(room_key, state_data):
+                logger.error(f"保存房间状态到Redis失败: 房间={room_number}")
+                # 如果Redis保存失败，回退到内存存储
+                with room_state_lock:
+                    room_monitoring_state[room_key] = state_data
+                    logger.warning(f"已回退到内存存储房间状态: 房间={room_number}")
             
             # 记录到数据库
             cursor = db.cursor()
@@ -271,18 +285,18 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
         if db:
             db.close()
 
-def get_current_electricity_reading(db, hotel_id, room_number):
+def get_current_electricity_reading(db, room_number):
     """获取当前电表读数"""
     try:
         cursor = db.cursor(dictionary=True)
         query = """
-        SELECT reading_value, script_time 
+        SELECT value as reading_value, gmt_modified as script_time, power
         FROM smart_meter 
-        WHERE hotel_id = %s AND room_number = %s 
-        ORDER BY script_time DESC 
+        WHERE room_num = %s 
+        ORDER BY gmt_modified DESC 
         LIMIT 1
         """
-        cursor.execute(query, (hotel_id, room_number))
+        cursor.execute(query, (room_number,))
         result = cursor.fetchone()
         cursor.close()
         return result
@@ -290,16 +304,113 @@ def get_current_electricity_reading(db, hotel_id, room_number):
         logger.error(f"获取当前电表读数失败: {str(e)}")
         return None
 
-def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consumption, continuous_periods, msg_type):
-    """记录异常用电情况到数据库"""
+def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consumption, continuous_periods, msg_type, device_name=None, current_power=0):
+    """记录异常用电情况到数据库
+    
+    Args:
+        db: 数据库连接
+        hotel_id: 酒店ID
+        room_number: 房间号
+        detected_time: 检测时间
+        total_consumption: 总消耗电量
+        continuous_periods: 连续异常周期数
+        msg_type: 消息类型
+        device_name: 设备名称，如果为None则从数据库获取
+        current_power: 当前功率
+    """
     try:
         cursor = db.cursor()
+        
+        # 使用snowflake算法生成主键ID
+        snowflake_gen = SnowflakeGenerator(42)  # datacenter_id=1, worker_id=1
+        unique_id = str(next(snowflake_gen))
+        
+        # 如果未提供设备名称，则从数据库获取
+        if device_name is None:
+            device_info_cursor = db.cursor(dictionary=True)
+            device_query = """
+            SELECT device_name, power 
+            FROM smart_meter 
+            WHERE room_num = %s 
+            ORDER BY gmt_modified DESC 
+            LIMIT 1
+            """
+            device_info_cursor.execute(device_query, (room_number,))
+            device_info = device_info_cursor.fetchone()
+            device_info_cursor.close()
+            
+            if device_info and 'device_name' in device_info:
+                device_name = device_info['device_name']
+                if current_power == 0 and 'power' in device_info:
+                    current_power = float(device_info['power'])
+            else:
+                device_name = "未知设备"
+        
+        # 获取酒店信息 - 这里需要从其他表获取，如果没有相关表，可以暂时使用默认值
+        dept_name = "null"  # 这里需要根据实际情况从其他表获取
+        dept_id = hotel_id
+        dept_brand = "未知品牌"  # 这里需要根据实际情况从其他表获取
+        
+        # 确定房态和入住/退房时间
+        room_status = "已入住" if msg_type == MSG_TYPE_CHECKIN else "已退房"
+        
+        # 计算电费（假设每度电1元，可以根据实际情况调整）
+        electricity_cost = float(total_consumption) * 1.0
+        
+        # 确定用电状态
+        electricity_usage_status = "异常"
+        
+        # 插入新表
         insert_query = """
+        INSERT INTO abnormal_electricity_usage 
+        (id, dept_name, dept_id, dept_brand, room_num, device_name, room_status, 
+        check_in_time, check_out_time, electricity_usage_status, abnormal_time, 
+        power_consumption, estimated_electricity_cost) 
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        # 获取房间状态相关时间
+        room_state_key = f"{room_number}_{msg_type}"
+        with room_state_lock:
+            if room_state_key in room_monitoring_state:
+                state = room_monitoring_state[room_state_key]
+                reference_time = state.get('reference_time')
+                end_time = state.get('end_time')
+            else:
+                reference_time = None
+                end_time = None
+        
+        # 根据消息类型设置入住和退房时间
+        if msg_type == MSG_TYPE_CHECKIN:
+            check_in_time = reference_time
+            check_out_time = end_time
+        else:  # MSG_TYPE_CHECKOUT
+            check_in_time = None  # 这里可能需要从历史记录中获取
+            check_out_time = reference_time
+        
+        cursor.execute(insert_query, (
+            unique_id,
+            dept_name,
+            dept_id,
+            dept_brand,
+            room_number,
+            device_name,
+            room_status,
+            check_in_time,
+            check_out_time,
+            electricity_usage_status,
+            detected_time,
+            total_consumption,
+            electricity_cost
+        ))
+        
+        # 同时保持对原表的支持，以确保系统兼容性
+        original_insert_query = """
         INSERT INTO electricity_abnormal 
         (hotel_id, room_number, detected_time, total_consumption, continuous_periods, is_notified, msg_type) 
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(insert_query, (
+        cursor.execute(original_insert_query, (
             hotel_id, 
             room_number, 
             detected_time, 
@@ -308,8 +419,10 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
             True,
             msg_type
         ))
+        
         db.commit()
         cursor.close()
+        logger.info(f"已记录异常用电情况到新表: 酒店={dept_id}, 房间={room_number}, 设备={device_name}, 电量={total_consumption}, 功率={current_power}W, 时间={detected_time}")
         return True
     except Exception as e:
         logger.error(f"记录异常用电失败: {str(e)}")
@@ -327,11 +440,16 @@ def process_room_batch(room_keys_batch):
     
     try:
         for room_key in room_keys_batch:
-            # 使用线程锁保护读取操作
-            with room_state_lock:
-                if room_key not in room_monitoring_state:
-                    continue
-                state = room_monitoring_state[room_key].copy()  # 复制一份避免竞态条件
+            # 首先尝试从Redis获取状态数据
+            state = load_state_from_redis(room_key)
+            
+            # 如果Redis中不存在，则尝试从内存中获取
+            if state is None:
+                with room_state_lock:
+                    if room_key not in room_monitoring_state:
+                        logger.debug(f"找不到房间监控状态: key={room_key}")
+                        continue
+                    state = room_monitoring_state[room_key].copy()  # 复制一份避免竞态条件
             
             hotel_id = state['hotel_id']
             room_number = state['room_number']
@@ -346,27 +464,40 @@ def process_room_batch(room_keys_batch):
                 
                 if datetime.now() > end_time:
                     logger.info(f"房间已超过监控结束时间，停止监控: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}")
+                    # 从Redis中删除数据
+                    delete_state_from_redis(room_key)
+                    # 也从内存中删除（如果存在）
                     with room_state_lock:
                         if room_key in room_monitoring_state:
                             del room_monitoring_state[room_key]
                     continue
             
-            # 查询当前用电量
-            result = get_current_electricity_reading(db, hotel_id, room_number)
+            # 查询当前用电量 - 只传递room_number参数
+            result = get_current_electricity_reading(db, room_number)
             
             if result:
                 current_reading = float(result['reading_value'])
                 timestamp = result['script_time']
+                current_power = float(result.get('power', 0))  # 获取当前功率
+                
+                # 解析last_check_time（如果是字符串）
+                last_check_time = state['last_check_time']
+                if isinstance(last_check_time, str):
+                    last_check_time = datetime.strptime(last_check_time, "%Y-%m-%d %H:%M:%S")
                 
                 # 计算差值
                 last_reading = float(state['last_reading'])
                 diff = current_reading - last_reading
                 
-                logger.info(f"房间用电检查: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}, 当前读数={current_reading}, 上次读数={last_reading}, 差值={diff}, 阈值={threshold}")
+                logger.info(f"房间用电检查: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}, 当前读数={current_reading}, 当前功率={current_power}W, 上次读数={last_reading}, 差值={diff}, 阈值={threshold}")
                 
                 # 更新状态（添加新读数和差值）
                 readings_history = state['readings_history'].copy()
-                readings_history.append((timestamp, current_reading, diff))
+                
+                # 确保timestamp是字符串格式，以便JSON序列化
+                timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S") if isinstance(timestamp, datetime) else timestamp
+                
+                readings_history.append((timestamp_str, current_reading, diff, current_power))
                 
                 # 限制历史记录数量
                 max_history_size = CONFIG['monitoring']['max_history_size']
@@ -388,18 +519,38 @@ def process_room_batch(room_keys_batch):
                         
                         logger.critical(f"触发用电报警: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}, 连续异常={abnormal_count}次, 总异常用电={total_abnormal}")
                         
+                        # 获取设备信息
+                        device_info_cursor = db.cursor(dictionary=True)
+                        device_query = """
+                        SELECT device_name, power 
+                        FROM smart_meter 
+                        WHERE room_num = %s 
+                        ORDER BY gmt_modified DESC 
+                        LIMIT 1
+                        """
+                        device_info_cursor.execute(device_query, (room_number,))
+                        device_info = device_info_cursor.fetchone()
+                        device_info_cursor.close()
+                        
+                        device_name = device_info['device_name'] if device_info and 'device_name' in device_info else "未知设备"
+                        current_power = float(device_info['power']) if device_info and 'power' in device_info else 0
+                        
                         # 记录异常到数据库
-                        record_abnormal_usage(db, hotel_id, room_number, timestamp, total_abnormal, abnormal_count, msg_type)
+                        record_abnormal_usage(db, hotel_id, room_number, timestamp, total_abnormal, abnormal_count, msg_type, device_name=device_name, current_power=current_power)
                         
                         # 发送飞书通知
                         type_name = "入住后" if msg_type == MSG_TYPE_CHECKIN else "离店后"
+                        
                         message = (
                             f"酒店ID: {hotel_id}\n"
                             f"房间号: {room_number}\n"
+                            f"设备名称: {device_name}\n"
                             f"监控类型: {type_name}\n"
                             f"连续{abnormal_count}次出现用电异常\n"
                             f"总计过量用电: {total_abnormal:.2f}度\n"
-                            f"检测时间: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+                            f"当前功率: {current_power}W\n"
+                            f"预估电费: {total_abnormal * 1.0:.2f}元\n"
+                            f"检测时间: {timestamp_str if isinstance(timestamp, str) else timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
                         )
                         send_feishu_notification(message)
                         
@@ -411,15 +562,28 @@ def process_room_batch(room_keys_batch):
                         logger.info(f"重置异常计数: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}")
                         abnormal_count = 0
                 
-                # 使用线程锁保护更新操作
-                with room_state_lock:
-                    if room_key in room_monitoring_state:  # 确保键仍然存在
-                        room_monitoring_state[room_key].update({
-                            'last_reading': current_reading,
-                            'last_check_time': timestamp,
-                            'abnormal_count': abnormal_count,
-                            'readings_history': readings_history
-                        })
+                # 创建更新后的状态
+                updated_state = state.copy()
+                updated_state.update({
+                    'last_reading': current_reading,
+                    'last_check_time': timestamp_str if isinstance(timestamp, str) else timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    'abnormal_count': abnormal_count,
+                    'readings_history': readings_history
+                })
+                
+                # 保存到Redis
+                if not save_state_to_redis(room_key, updated_state):
+                    logger.error(f"更新房间状态到Redis失败: 房间={room_number}")
+                    # 如果Redis保存失败，回退到内存存储
+                    with room_state_lock:
+                        if room_key in room_monitoring_state:  # 确保键仍然存在
+                            room_monitoring_state[room_key].update({
+                                'last_reading': current_reading,
+                                'last_check_time': timestamp,
+                                'abnormal_count': abnormal_count,
+                                'readings_history': readings_history
+                            })
+                            logger.warning(f"已回退到内存更新房间状态: 房间={room_number}")
             else:
                 logger.warning(f"未找到当前电表读数: 酒店={hotel_id}, 房间={room_number}")
     except Exception as e:
@@ -430,17 +594,26 @@ def process_room_batch(room_keys_batch):
 
 def check_electricity_usage():
     """检查所有监控房间的用电情况，使用批处理方式"""
-    room_count = len(room_monitoring_state)
+    # 首先尝试从Redis获取所有监控房间的键
+    redis_room_keys = get_all_monitoring_keys()
+    
+    # 如果Redis中有键，使用Redis的键
+    if redis_room_keys:
+        room_keys = redis_room_keys
+        room_count = len(room_keys)
+        logger.info(f"从Redis获取监控房间, 数量: {room_count}")
+    else:
+        # 否则，使用内存中的状态数据
+        with room_state_lock:
+            room_count = len(room_monitoring_state)
+            room_keys = list(room_monitoring_state.keys())
+        logger.info(f"从内存获取监控房间, 数量: {room_count}")
+    
     logger.info(f"开始检查房间用电情况, 当前监控房间数: {room_count}")
     
-    if not room_monitoring_state:
+    if not room_keys:
         logger.info("当前没有需要监控的房间")
         return
-    
-    # 获取当前状态的快照（使用线程锁）
-    with room_state_lock:
-        # 复制键集合，因为我们可能会在迭代过程中修改字典
-        room_keys = list(room_monitoring_state.keys())
     
     # 分批处理
     batch_size = CONFIG['monitoring']['batch_size']
@@ -624,6 +797,15 @@ def shutdown_gracefully():
     logger.info("等待所有线程结束...")
     time.sleep(5)  # 给线程一些时间来清理
     
+    # 关闭Redis连接
+    global redis_conn
+    if redis_conn:
+        try:
+            redis_conn.close()
+            logger.info("已关闭Redis连接")
+        except:
+            pass
+    
     logger.info("系统已关闭")
 
 def main():
@@ -637,6 +819,25 @@ def main():
         if not mysql_pool:
             logger.error("无法创建MySQL连接池，系统无法启动")
             return
+        
+        # 初始化Redis连接
+        global redis_conn
+        redis_conn = create_redis_connection()
+        if not redis_conn:
+            logger.warning("无法创建Redis连接，将使用内存存储状态数据")
+        else:
+            logger.info("Redis连接已建立，将使用Redis存储状态数据")
+            
+            # 尝试加载已有的房间状态数据
+            redis_room_keys = get_all_monitoring_keys()
+            if redis_room_keys:
+                logger.info(f"从Redis加载已有监控状态，共{len(redis_room_keys)}个房间")
+                for room_key in redis_room_keys:
+                    state = load_state_from_redis(room_key)
+                    if state:
+                        with room_state_lock:
+                            room_monitoring_state[room_key] = state
+                logger.info(f"已将Redis中的房间状态加载到内存，共{len(room_monitoring_state)}个房间")
         
         # 启动多个消费者线程
         consumer_threads = []
@@ -656,7 +857,22 @@ def main():
         logger.info(f"已设置定时检查任务，间隔={check_interval}分钟")
         
         # 添加系统状态打印任务
-        schedule.every(10).minutes.do(lambda: logger.info(f"系统运行中，当前监控房间数: {len(room_monitoring_state)}"))
+        def print_system_status():
+            # 首先尝试从Redis获取所有监控房间的键
+            redis_room_keys = get_all_monitoring_keys()
+            redis_count = len(redis_room_keys)
+            
+            # 从内存中获取房间数
+            memory_count = len(room_monitoring_state)
+            
+            if redis_conn:
+                logger.info(f"系统运行中，Redis监控房间数: {redis_count}, 内存监控房间数: {memory_count}")
+            else:
+                logger.info(f"系统运行中，当前监控房间数: {memory_count}")
+            
+            return True
+        
+        schedule.every(10).minutes.do(print_system_status)
         
         # 运行定时任务
         while True:
@@ -670,6 +886,131 @@ def main():
         shutdown_gracefully()
     finally:
         logger.info("酒店用电异常监控系统已停止")
+
+def create_redis_connection():
+    """创建Redis连接"""
+    try:
+        conn = redis.Redis(
+            host=CONFIG['redis']['host'],
+            port=CONFIG['redis']['port'],
+            db=CONFIG['redis']['db'],
+            password=CONFIG['redis']['password'],
+            decode_responses=True  # 自动将字节解码为字符串
+        )
+        # 测试连接
+        conn.ping()
+        logger.info(f"Redis连接创建成功，地址={CONFIG['redis']['host']}:{CONFIG['redis']['port']}")
+        return conn
+    except Exception as e:
+        logger.error(f"创建Redis连接失败: {str(e)}")
+        return None
+
+def get_redis_connection():
+    """获取Redis连接"""
+    global redis_conn
+    
+    if redis_conn is None:
+        redis_conn = create_redis_connection()
+    
+    # 如果连接断开，重新连接
+    if redis_conn is not None:
+        try:
+            redis_conn.ping()
+        except:
+            logger.warning("Redis连接已断开，尝试重新连接")
+            redis_conn = create_redis_connection()
+    
+    return redis_conn
+
+def save_state_to_redis(room_key, state_data):
+    """将房间监控状态保存到Redis"""
+    try:
+        conn = get_redis_connection()
+        if conn is None:
+            logger.error(f"保存状态到Redis失败: 无法获取Redis连接")
+            return False
+            
+        # 序列化状态数据
+        serialized_data = json.dumps(state_data)
+        
+        # 生成Redis键
+        redis_key = f"{CONFIG['redis']['key_prefix']}{room_key}"
+        
+        # 保存到Redis并设置过期时间
+        conn.set(redis_key, serialized_data)
+        conn.expire(redis_key, CONFIG['redis']['expire_time'])
+        
+        logger.debug(f"成功保存状态到Redis: key={redis_key}")
+        return True
+    except Exception as e:
+        logger.error(f"保存状态到Redis异常: {str(e)}")
+        return False
+
+def load_state_from_redis(room_key):
+    """从Redis加载房间监控状态"""
+    try:
+        conn = get_redis_connection()
+        if conn is None:
+            logger.error(f"从Redis加载状态失败: 无法获取Redis连接")
+            return None
+            
+        # 生成Redis键
+        redis_key = f"{CONFIG['redis']['key_prefix']}{room_key}"
+        
+        # 从Redis获取数据
+        data = conn.get(redis_key)
+        
+        if data:
+            # 反序列化数据
+            state_data = json.loads(data)
+            logger.debug(f"成功从Redis加载状态: key={redis_key}")
+            return state_data
+        else:
+            logger.debug(f"Redis中不存在此键: key={redis_key}")
+            return None
+    except Exception as e:
+        logger.error(f"从Redis加载状态异常: {str(e)}")
+        return None
+
+def delete_state_from_redis(room_key):
+    """从Redis删除房间监控状态"""
+    try:
+        conn = get_redis_connection()
+        if conn is None:
+            logger.error(f"从Redis删除状态失败: 无法获取Redis连接")
+            return False
+            
+        # 生成Redis键
+        redis_key = f"{CONFIG['redis']['key_prefix']}{room_key}"
+        
+        # 从Redis删除数据
+        conn.delete(redis_key)
+        logger.debug(f"成功从Redis删除状态: key={redis_key}")
+        return True
+    except Exception as e:
+        logger.error(f"从Redis删除状态异常: {str(e)}")
+        return False
+
+def get_all_monitoring_keys():
+    """获取所有被监控的房间键"""
+    try:
+        conn = get_redis_connection()
+        if conn is None:
+            logger.error("获取监控房间键失败: 无法获取Redis连接")
+            return []
+            
+        # 使用模式匹配查找所有键
+        pattern = f"{CONFIG['redis']['key_prefix']}*"
+        all_keys = conn.keys(pattern)
+        
+        # 移除前缀
+        prefix_len = len(CONFIG['redis']['key_prefix'])
+        room_keys = [key[prefix_len:] for key in all_keys]
+        
+        return room_keys
+    except Exception as e:
+        logger.error(f"获取监控房间键异常: {str(e)}")
+        return []
 
 if __name__ == "__main__":
     main() 

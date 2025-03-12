@@ -36,7 +36,8 @@ def connect_rabbitmq():
         channel = connection.channel()
         
         # 声明队列（确保队列存在）
-        queue_name = 'hotel_checkin_queue'
+        queue_name = 'MQ.PMS.CHECKIN.CHECKOUT.TEST'
+        # 'EX.FANOUT.PMS.CHECKIN.CHECKOUT.TEST'
         channel.queue_declare(queue=queue_name, durable=True)
         
         print(f"已连接到RabbitMQ服务器 192.168.1.204:5672")

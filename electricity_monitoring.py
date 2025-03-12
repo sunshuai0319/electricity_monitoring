@@ -35,7 +35,7 @@ CONFIG = {
         'virtual_host': '/',
         'username': 'zxtf',
         'password': 'zxtf123',
-        'queue': 'hotel_checkin_queue'
+        'queue': 'MQ.PMS.CHECKIN.CHECKOUT.TEST'
     },
     'mysql': {
         'host': '192.168.1.204',

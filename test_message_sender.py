@@ -18,8 +18,8 @@ def parse_arguments():
     parser.add_argument('--vhost', default='/', help='RabbitMQ虚拟主机')
     parser.add_argument('--username', default='zxtf', help='RabbitMQ用户名')
     parser.add_argument('--password', default='zxtf123', help='RabbitMQ密码')
-    parser.add_argument('--queue', default='hotel_checkin_queue', help='目标队列名')
-    
+    parser.add_argument('--exchange', default='EX.FANOUT.PMS.CHECKIN.CHECKOUT.TEST', help='目标交换机名称')
+
     parser.add_argument('--dept-code', required=True, help='部门编码(门店编码)')
     parser.add_argument('--room-number', required=True, help='房间号')
     
@@ -96,13 +96,17 @@ def send_test_message(args):
         connection = pika.BlockingConnection(parameters)
         channel = connection.channel()
         
-        # 声明队列（确保队列存在）
-        channel.queue_declare(queue=args.queue, durable=True)
+        # 声明交换机（确保交换机存在）
+        channel.exchange_declare(
+            exchange=args.exchange,
+            exchange_type='fanout',
+            durable=True
+        )
         
-        # 发送消息
+        # 发送消息到交换机
         channel.basic_publish(
-            exchange='',
-            routing_key=args.queue,
+            exchange=args.exchange,
+            routing_key='',  # fanout交换机忽略routing_key
             body=json.dumps(message),
             properties=pika.BasicProperties(
                 delivery_mode=2,  # 持久化消息
@@ -110,7 +114,7 @@ def send_test_message(args):
             )
         )
         
-        print(f"{message_type_desc}已发送到队列 {args.queue}:")
+        print(f"{message_type_desc}已发送到交换机 {args.exchange}:")
         print(json.dumps(message, indent=2, ensure_ascii=False))
         
         connection.close()

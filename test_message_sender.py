@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import pika
@@ -14,14 +13,14 @@ def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='发送测试入住/离店消息到RabbitMQ')
     
-    parser.add_argument('--host', default='localhost', help='RabbitMQ服务器地址')
+    parser.add_argument('--host', default='192.168.1.204', help='RabbitMQ服务器地址')
     parser.add_argument('--port', type=int, default=5672, help='RabbitMQ服务器端口')
     parser.add_argument('--vhost', default='/', help='RabbitMQ虚拟主机')
-    parser.add_argument('--username', default='guest', help='RabbitMQ用户名')
-    parser.add_argument('--password', default='guest', help='RabbitMQ密码')
+    parser.add_argument('--username', default='zxtf', help='RabbitMQ用户名')
+    parser.add_argument('--password', default='zxtf123', help='RabbitMQ密码')
     parser.add_argument('--queue', default='hotel_checkin_queue', help='目标队列名')
     
-    parser.add_argument('--hotel-id', required=True, help='酒店ID')
+    parser.add_argument('--dept-code', required=True, help='部门编码(门店编码)')
     parser.add_argument('--room-number', required=True, help='房间号')
     
     # 消息类型参数
@@ -41,7 +40,7 @@ def parse_arguments():
 def send_test_message(args):
     """发送测试消息到RabbitMQ"""
     message = {
-        'hotel_id': args.hotel_id,
+        'dept_code': args.dept_code,  # 使用dept_code代替hotel_id
         'room_number': args.room_number
     }
     

@@ -44,7 +44,8 @@ CONFIG = {
         'password': 'root',
         'database': 'zxtf_saas_test',
         'pool_name': 'hotel_monitoring_pool',
-        'pool_size': 10  # 连接池大小
+        'pool_size': 10,  # 连接池大小
+        'ssl_disabled': True  # 禁用SSL连接
     },
     'redis': {
         'host': '192.168.1.204',  # Redis服务器地址，需要根据实际情况修改
@@ -102,7 +103,8 @@ def create_mysql_pool():
             'port': CONFIG['mysql']['port'],
             'user': CONFIG['mysql']['user'],
             'password': CONFIG['mysql']['password'],
-            'database': CONFIG['mysql']['database']
+            'database': CONFIG['mysql']['database'],
+            'ssl_disabled': True  # 禁用SSL连接
         }
         
         pool = mysql.connector.pooling.MySQLConnectionPool(**pool_config)
@@ -171,30 +173,66 @@ def send_feishu_notification(message):
         logger.error(f"飞书通知发送异常: {str(e)}")
         return False
 
-def find_closest_electricity_reading(db, room_number, reference_time):
-    """查找与参考时间最接近的电表读数"""
+def find_closest_electricity_reading(db, room_number, reference_time, product_keys=None):
+    """查找与参考时间最接近的电表读数
+    
+    Args:
+        db: 数据库连接
+        room_number: 房间号
+        reference_time: 参考时间
+        product_keys: 产品Key列表，用于筛选同一酒店的设备
+    
+    Returns:
+        最接近的电表读数或None
+    """
     try:
         cursor = db.cursor(dictionary=True)
-        query = """
-        SELECT id, value as reading_value, gmt_modified as script_time 
-        FROM smart_meter 
-        WHERE room_num = %s 
-        ORDER BY ABS(TIMESTAMPDIFF(SECOND, gmt_modified, %s)) 
-        LIMIT 1
-        """
-        cursor.execute(query, (room_number, reference_time))
+        
+        if product_keys and len(product_keys) > 0:
+            # 构建IN查询的参数占位符
+            placeholders = ', '.join(['%s'] * len(product_keys))
+            
+            query = f"""
+            SELECT id, value as reading_value, gmt_modified as script_time, 
+                   device_name, power, product_key
+            FROM smart_meter 
+            WHERE room_num = %s 
+              AND product_key IN ({placeholders})
+            ORDER BY ABS(TIMESTAMPDIFF(SECOND, gmt_modified, %s)) 
+            LIMIT 1
+            """
+            
+            # 构建查询参数
+            params = [room_number] + product_keys + [reference_time]
+            cursor.execute(query, params)
+        else:
+            # 如果没有提供product_key，则只按房间号查询
+            query = """
+            SELECT id, value as reading_value, gmt_modified as script_time, 
+                   device_name, power, product_key
+            FROM smart_meter 
+            WHERE room_num = %s 
+            ORDER BY ABS(TIMESTAMPDIFF(SECOND, gmt_modified, %s)) 
+            LIMIT 1
+            """
+            cursor.execute(query, (room_number, reference_time))
+        
         result = cursor.fetchone()
         cursor.close()
+        
+        if result:
+            logger.debug(f"找到最接近时间的电表读数: 房间={room_number}, 产品Key={result.get('product_key', 'unknown')}")
+        
         return result
     except Exception as e:
         logger.error(f"查询最近电表读数失败: {str(e)}")
         return None
 
-def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, msg_type):
+def initialize_room_monitoring(dept_code, room_number, reference_time, end_time, msg_type):
     """初始化房间监控状态
     
     Args:
-        hotel_id: 酒店ID
+        dept_code: 部门编码(门店编码)
         room_number: 房间号
         reference_time: 参考时间（入住消息为抵店时间，离店消息为抵店时间）
         end_time: 结束时间（入住消息为预离时间，离店消息为实际离店时间）
@@ -205,13 +243,22 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
         if not db:
             logger.error("初始化房间监控失败: 无法连接数据库")
             return False
+        
+        # 根据dept_code获取product_keys
+        product_keys = get_product_key_by_dept_code(db, dept_code)
+        if not product_keys:
+            logger.warning(f"未找到部门对应的产品Key, 将只按房间号查询: dept_code={dept_code}, 房间={room_number}")
+        else:
+            logger.info(f"找到部门对应的产品Key: dept_code={dept_code}, product_keys={product_keys}")
             
-        # 查询最接近参考时间的用电量记录，只传递room_number参数
-        result = find_closest_electricity_reading(db, room_number, reference_time)
+        # 查询最接近参考时间的用电量记录
+        result = find_closest_electricity_reading(db, room_number, reference_time, product_keys)
         
         if result:
             initial_reading = float(result['reading_value'])
             timestamp = result['script_time']
+            device_name = result.get('device_name', '未知设备')
+            product_key = result.get('product_key', '')
             
             # 生成房间唯一键，不再使用hotel_id，仅使用房间号和消息类型区分不同监控
             room_key = f"{room_number}_{msg_type}"
@@ -224,8 +271,10 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
             
             # 创建状态数据
             state_data = {
-                'hotel_id': hotel_id,
+                'dept_code': dept_code,
                 'room_number': room_number,
+                'product_key': product_key,
+                'device_name': device_name,
                 'reference_time': reference_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(reference_time, datetime) else reference_time,
                 'end_time': end_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(end_time, datetime) else end_time,
                 'initial_reading': initial_reading,
@@ -258,25 +307,28 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
             
             insert_query = f"""
             INSERT INTO electricity_monitoring 
-            (hotel_id, room_number, {time_field_name}, {end_time_field_name}, initial_reading, monitoring_start_time, msg_type) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (dept_code, room_number, {time_field_name}, {end_time_field_name}, 
+            initial_reading, monitoring_start_time, msg_type, product_key, device_name) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(insert_query, (
-                hotel_id, 
+                dept_code, 
                 room_number, 
                 reference_time, 
                 end_time, 
                 initial_reading, 
                 timestamp,
-                msg_type
+                msg_type,
+                product_key,
+                device_name
             ))
             db.commit()
             cursor.close()
             
-            logger.info(f"已初始化房间{msg_type}监控: 酒店={hotel_id}, 房间={room_number}, 初始读数={initial_reading}, 阈值={threshold}")
+            logger.info(f"已初始化房间{msg_type}监控: 部门编码={dept_code}, 房间={room_number}, 初始读数={initial_reading}, 阈值={threshold}")
             return True
         else:
-            logger.warning(f"未找到房间电表读数: 酒店={hotel_id}, 房间={room_number}")
+            logger.warning(f"未找到房间电表读数: 部门编码={dept_code}, 房间={room_number}")
             return False
     except Exception as e:
         logger.error(f"初始化房间监控异常: {str(e)}")
@@ -285,31 +337,66 @@ def initialize_room_monitoring(hotel_id, room_number, reference_time, end_time, 
         if db:
             db.close()
 
-def get_current_electricity_reading(db, room_number):
-    """获取当前电表读数"""
+def get_current_electricity_reading(db, room_number, product_keys=None):
+    """获取当前电表读数
+    
+    Args:
+        db: 数据库连接
+        room_number: 房间号
+        product_keys: 产品Key列表，用于筛选同一酒店的设备
+    
+    Returns:
+        当前电表读数或None
+    """
     try:
         cursor = db.cursor(dictionary=True)
-        query = """
-        SELECT value as reading_value, gmt_modified as script_time, power
-        FROM smart_meter 
-        WHERE room_num = %s 
-        ORDER BY gmt_modified DESC 
-        LIMIT 1
-        """
-        cursor.execute(query, (room_number,))
+        
+        if product_keys and len(product_keys) > 0:
+            # 构建IN查询的参数占位符
+            placeholders = ', '.join(['%s'] * len(product_keys))
+            
+            query = f"""
+            SELECT value as reading_value, gmt_modified as script_time, power, 
+                   device_name, product_key, device_key, iot_id
+            FROM smart_meter 
+            WHERE room_num = %s 
+              AND product_key IN ({placeholders})
+            ORDER BY gmt_modified DESC 
+            LIMIT 1
+            """
+            
+            # 构建查询参数
+            params = [room_number] + product_keys
+            cursor.execute(query, params)
+        else:
+            # 如果没有提供product_key，则只按房间号查询
+            query = """
+            SELECT value as reading_value, gmt_modified as script_time, power,
+                   device_name, product_key, device_key, iot_id
+            FROM smart_meter 
+            WHERE room_num = %s 
+            ORDER BY gmt_modified DESC 
+            LIMIT 1
+            """
+            cursor.execute(query, (room_number,))
+        
         result = cursor.fetchone()
         cursor.close()
+        
+        if result:
+            logger.debug(f"获取到当前电表读数: 房间={room_number}, 产品Key={result.get('product_key', 'unknown')}")
+        
         return result
     except Exception as e:
         logger.error(f"获取当前电表读数失败: {str(e)}")
         return None
 
-def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consumption, continuous_periods, msg_type, device_name=None, current_power=0):
+def record_abnormal_usage(db, dept_code, room_number, detected_time, total_consumption, continuous_periods, msg_type, device_name=None, current_power=0):
     """记录异常用电情况到数据库
     
     Args:
         db: 数据库连接
-        hotel_id: 酒店ID
+        dept_code: 部门编码(门店编码)
         room_number: 房间号
         detected_time: 检测时间
         total_consumption: 总消耗电量
@@ -322,20 +409,38 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
         cursor = db.cursor()
         
         # 使用snowflake算法生成主键ID
-        snowflake_gen = SnowflakeGenerator(42)  # datacenter_id=1, worker_id=1
+        snowflake_gen = SnowflakeGenerator(1, 1)  # datacenter_id=1, worker_id=1
         unique_id = str(next(snowflake_gen))
         
         # 如果未提供设备名称，则从数据库获取
         if device_name is None:
+            # 尝试获取产品Key
+            product_keys = get_product_key_by_dept_code(db, dept_code)
+            
             device_info_cursor = db.cursor(dictionary=True)
-            device_query = """
-            SELECT device_name, power 
-            FROM smart_meter 
-            WHERE room_num = %s 
-            ORDER BY gmt_modified DESC 
-            LIMIT 1
-            """
-            device_info_cursor.execute(device_query, (room_number,))
+            if product_keys:
+                # 构建IN查询的参数占位符
+                placeholders = ', '.join(['%s'] * len(product_keys))
+                device_query = f"""
+                SELECT device_name, power 
+                FROM smart_meter 
+                WHERE room_num = %s 
+                  AND product_key IN ({placeholders})
+                ORDER BY gmt_modified DESC 
+                LIMIT 1
+                """
+                params = [room_number] + product_keys
+                device_info_cursor.execute(device_query, params)
+            else:
+                device_query = """
+                SELECT device_name, power 
+                FROM smart_meter 
+                WHERE room_num = %s 
+                ORDER BY gmt_modified DESC 
+                LIMIT 1
+                """
+                device_info_cursor.execute(device_query, (room_number,))
+            
             device_info = device_info_cursor.fetchone()
             device_info_cursor.close()
             
@@ -346,10 +451,21 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
             else:
                 device_name = "未知设备"
         
-        # 获取酒店信息 - 这里需要从其他表获取，如果没有相关表，可以暂时使用默认值
-        dept_name = "null"  # 这里需要根据实际情况从其他表获取
-        dept_id = hotel_id
-        dept_brand = "未知品牌"  # 这里需要根据实际情况从其他表获取
+        # 获取部门信息
+        dept_info_cursor = db.cursor(dictionary=True)
+        dept_query = """
+        SELECT dept_id, dept_code, dept_name, dept_brand 
+        FROM iot_product_dept 
+        WHERE dept_code = %s 
+        LIMIT 1
+        """
+        dept_info_cursor.execute(dept_query, (dept_code,))
+        dept_info = dept_info_cursor.fetchone()
+        dept_info_cursor.close()
+        
+        dept_name = dept_info['dept_name'] if dept_info and 'dept_name' in dept_info else "未知酒店"
+        dept_id = dept_info['dept_id'] if dept_info and 'dept_id' in dept_info else dept_code
+        dept_brand = dept_info['dept_brand'] if dept_info and 'dept_brand' in dept_info else "未知品牌"
         
         # 确定房态和入住/退房时间
         room_status = "已入住" if msg_type == MSG_TYPE_CHECKIN else "已退房"
@@ -377,8 +493,13 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
                 reference_time = state.get('reference_time')
                 end_time = state.get('end_time')
             else:
-                reference_time = None
-                end_time = None
+                state = load_state_from_redis(room_state_key)
+                if state:
+                    reference_time = state.get('reference_time')
+                    end_time = state.get('end_time')
+                else:
+                    reference_time = None
+                    end_time = None
         
         # 根据消息类型设置入住和退房时间
         if msg_type == MSG_TYPE_CHECKIN:
@@ -387,6 +508,12 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
         else:  # MSG_TYPE_CHECKOUT
             check_in_time = None  # 这里可能需要从历史记录中获取
             check_out_time = reference_time
+        
+        # 处理字符串格式的时间
+        if isinstance(check_in_time, str):
+            check_in_time = datetime.strptime(check_in_time, "%Y-%m-%d %H:%M:%S")
+        if isinstance(check_out_time, str):
+            check_out_time = datetime.strptime(check_out_time, "%Y-%m-%d %H:%M:%S")
         
         cursor.execute(insert_query, (
             unique_id,
@@ -407,11 +534,11 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
         # 同时保持对原表的支持，以确保系统兼容性
         original_insert_query = """
         INSERT INTO electricity_abnormal 
-        (hotel_id, room_number, detected_time, total_consumption, continuous_periods, is_notified, msg_type) 
+        (dept_code, room_number, detected_time, total_consumption, continuous_periods, is_notified, msg_type) 
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(original_insert_query, (
-            hotel_id, 
+            dept_code, 
             room_number, 
             detected_time, 
             total_consumption, 
@@ -422,7 +549,7 @@ def record_abnormal_usage(db, hotel_id, room_number, detected_time, total_consum
         
         db.commit()
         cursor.close()
-        logger.info(f"已记录异常用电情况到新表: 酒店={dept_id}, 房间={room_number}, 设备={device_name}, 电量={total_consumption}, 功率={current_power}W, 时间={detected_time}")
+        logger.info(f"已记录异常用电情况到新表: 部门编码={dept_code}, 房间={room_number}, 设备={device_name}, 电量={total_consumption}, 功率={current_power}W, 时间={detected_time}")
         return True
     except Exception as e:
         logger.error(f"记录异常用电失败: {str(e)}")
@@ -451,8 +578,9 @@ def process_room_batch(room_keys_batch):
                         continue
                     state = room_monitoring_state[room_key].copy()  # 复制一份避免竞态条件
             
-            hotel_id = state['hotel_id']
+            dept_code = state.get('dept_code')
             room_number = state['room_number']
+            product_key = state.get('product_key')
             msg_type = state.get('msg_type', MSG_TYPE_CHECKIN)  # 默认为入住类型，兼容旧数据
             threshold = state.get('threshold', CONFIG['monitoring']['checkin_abnormal_threshold'])  # 获取阈值
             
@@ -463,7 +591,7 @@ def process_room_batch(room_keys_batch):
                     end_time = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
                 
                 if datetime.now() > end_time:
-                    logger.info(f"房间已超过监控结束时间，停止监控: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}")
+                    logger.info(f"房间已超过监控结束时间，停止监控: 部门编码={dept_code}, 房间={room_number}, 类型={msg_type}")
                     # 从Redis中删除数据
                     delete_state_from_redis(room_key)
                     # 也从内存中删除（如果存在）
@@ -472,13 +600,23 @@ def process_room_batch(room_keys_batch):
                             del room_monitoring_state[room_key]
                     continue
             
-            # 查询当前用电量 - 只传递room_number参数
-            result = get_current_electricity_reading(db, room_number)
+            # 如果有product_key，则使用该信息查询电表数据
+            product_keys = None
+            if product_key:
+                product_keys = [product_key]
+            elif dept_code:
+                # 如果没有product_key但有dept_code，则重新获取产品key
+                product_keys = get_product_key_by_dept_code(db, dept_code)
+            
+            # 查询当前用电量
+            result = get_current_electricity_reading(db, room_number, product_keys)
             
             if result:
                 current_reading = float(result['reading_value'])
                 timestamp = result['script_time']
                 current_power = float(result.get('power', 0))  # 获取当前功率
+                device_name = result.get('device_name', state.get('device_name', '未知设备'))
+                product_key_from_db = result.get('product_key', '')
                 
                 # 解析last_check_time（如果是字符串）
                 last_check_time = state['last_check_time']
@@ -489,7 +627,7 @@ def process_room_batch(room_keys_batch):
                 last_reading = float(state['last_reading'])
                 diff = current_reading - last_reading
                 
-                logger.info(f"房间用电检查: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}, 当前读数={current_reading}, 当前功率={current_power}W, 上次读数={last_reading}, 差值={diff}, 阈值={threshold}")
+                logger.info(f"房间用电检查: 部门编码={dept_code}, 房间={room_number}, 设备={device_name}, 类型={msg_type}, 当前读数={current_reading}, 当前功率={current_power}W, 上次读数={last_reading}, 差值={diff}, 阈值={threshold}")
                 
                 # 更新状态（添加新读数和差值）
                 readings_history = state['readings_history'].copy()
@@ -508,7 +646,7 @@ def process_room_batch(room_keys_batch):
                 abnormal_count = state['abnormal_count']
                 if diff > threshold:
                     abnormal_count += 1
-                    logger.warning(f"检测到异常用电: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}, 差值={diff}, 连续次数={abnormal_count}")
+                    logger.warning(f"检测到异常用电: 部门编码={dept_code}, 房间={room_number}, 类型={msg_type}, 差值={diff}, 连续次数={abnormal_count}")
                     
                     # 如果连续异常次数达到阈值，触发报警
                     continuous_alert_count = CONFIG['monitoring']['continuous_alert_count']
@@ -517,34 +655,21 @@ def process_room_batch(room_keys_batch):
                         abnormal_readings = readings_history[-continuous_alert_count:]
                         total_abnormal = sum(reading[2] for reading in abnormal_readings)
                         
-                        logger.critical(f"触发用电报警: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}, 连续异常={abnormal_count}次, 总异常用电={total_abnormal}")
+                        logger.critical(f"触发用电报警: 部门编码={dept_code}, 房间={room_number}, 类型={msg_type}, 连续异常={abnormal_count}次, 总异常用电={total_abnormal}")
                         
-                        # 获取设备信息
-                        device_info_cursor = db.cursor(dictionary=True)
-                        device_query = """
-                        SELECT device_name, power 
-                        FROM smart_meter 
-                        WHERE room_num = %s 
-                        ORDER BY gmt_modified DESC 
-                        LIMIT 1
-                        """
-                        device_info_cursor.execute(device_query, (room_number,))
-                        device_info = device_info_cursor.fetchone()
-                        device_info_cursor.close()
-                        
-                        device_name = device_info['device_name'] if device_info and 'device_name' in device_info else "未知设备"
-                        current_power = float(device_info['power']) if device_info and 'power' in device_info else 0
+                        # 使用数据库中查到的设备信息
                         
                         # 记录异常到数据库
-                        record_abnormal_usage(db, hotel_id, room_number, timestamp, total_abnormal, abnormal_count, msg_type, device_name=device_name, current_power=current_power)
+                        record_abnormal_usage(db, dept_code, room_number, timestamp, total_abnormal, abnormal_count, msg_type, device_name=device_name, current_power=current_power)
                         
                         # 发送飞书通知
                         type_name = "入住后" if msg_type == MSG_TYPE_CHECKIN else "离店后"
                         
                         message = (
-                            f"酒店ID: {hotel_id}\n"
+                            f"部门编码: {dept_code}\n"
                             f"房间号: {room_number}\n"
                             f"设备名称: {device_name}\n"
+                            f"产品Key: {product_key_from_db}\n"
                             f"监控类型: {type_name}\n"
                             f"连续{abnormal_count}次出现用电异常\n"
                             f"总计过量用电: {total_abnormal:.2f}度\n"
@@ -559,7 +684,7 @@ def process_room_batch(room_keys_batch):
                 else:
                     # 重置连续计数
                     if abnormal_count > 0:
-                        logger.info(f"重置异常计数: 酒店={hotel_id}, 房间={room_number}, 类型={msg_type}")
+                        logger.info(f"重置异常计数: 部门编码={dept_code}, 房间={room_number}, 类型={msg_type}")
                         abnormal_count = 0
                 
                 # 创建更新后的状态
@@ -568,7 +693,9 @@ def process_room_batch(room_keys_batch):
                     'last_reading': current_reading,
                     'last_check_time': timestamp_str if isinstance(timestamp, str) else timestamp.strftime("%Y-%m-%d %H:%M:%S"),
                     'abnormal_count': abnormal_count,
-                    'readings_history': readings_history
+                    'readings_history': readings_history,
+                    'device_name': device_name,
+                    'product_key': product_key_from_db or product_key  # 优先使用新的产品key
                 })
                 
                 # 保存到Redis
@@ -581,11 +708,13 @@ def process_room_batch(room_keys_batch):
                                 'last_reading': current_reading,
                                 'last_check_time': timestamp,
                                 'abnormal_count': abnormal_count,
-                                'readings_history': readings_history
+                                'readings_history': readings_history,
+                                'device_name': device_name,
+                                'product_key': product_key_from_db or product_key
                             })
                             logger.warning(f"已回退到内存更新房间状态: 房间={room_number}")
             else:
-                logger.warning(f"未找到当前电表读数: 酒店={hotel_id}, 房间={room_number}")
+                logger.warning(f"未找到当前电表读数: 部门编码={dept_code}, 房间={room_number}")
     except Exception as e:
         logger.error(f"批量检查用电情况异常: {str(e)}")
     finally:
@@ -646,12 +775,12 @@ def process_message(message_data):
         message = json.loads(message_data)
         
         # 提取基本字段
-        hotel_id = message.get('hotel_id')
+        dept_code = message.get('dept_code')  # 使用dept_code替代hotel_id
         room_number = message.get('room_number')
         msg_type_code = message.get('msgType')
         
-        if not all([hotel_id, room_number]):
-            logger.error(f"消息格式错误，缺少必要字段hotel_id或room_number: {message_data}")
+        if not all([dept_code, room_number]):
+            logger.error(f"消息格式错误，缺少必要字段dept_code或room_number: {message_data}")
             return False
         
         # 根据msgType判断消息类型
@@ -673,13 +802,13 @@ def process_message(message_data):
             
             # 初始化入住房间监控
             success = initialize_room_monitoring(
-                hotel_id, room_number, check_in_time, expected_checkout_time, MSG_TYPE_CHECKIN
+                dept_code, room_number, check_in_time, expected_checkout_time, MSG_TYPE_CHECKIN
             )
             
             if success:
-                logger.info(f"成功初始化入住房间监控: 酒店={hotel_id}, 房间={room_number}")
+                logger.info(f"成功初始化入住房间监控: 部门编码={dept_code}, 房间={room_number}")
             else:
-                logger.warning(f"初始化入住房间监控失败: 酒店={hotel_id}, 房间={room_number}")
+                logger.warning(f"初始化入住房间监控失败: 部门编码={dept_code}, 房间={room_number}")
             
             return success
         
@@ -701,13 +830,13 @@ def process_message(message_data):
             
             # 初始化离店房间监控
             success = initialize_room_monitoring(
-                hotel_id, room_number, actual_checkin_time, actual_checkout_time, MSG_TYPE_CHECKOUT
+                dept_code, room_number, actual_checkin_time, actual_checkout_time, MSG_TYPE_CHECKOUT
             )
             
             if success:
-                logger.info(f"成功初始化离店房间监控: 酒店={hotel_id}, 房间={room_number}")
+                logger.info(f"成功初始化离店房间监控: 部门编码={dept_code}, 房间={room_number}")
             else:
-                logger.warning(f"初始化离店房间监控失败: 酒店={hotel_id}, 房间={room_number}")
+                logger.warning(f"初始化离店房间监控失败: 部门编码={dept_code}, 房间={room_number}")
             
             return success
         
@@ -1011,6 +1140,37 @@ def get_all_monitoring_keys():
     except Exception as e:
         logger.error(f"获取监控房间键异常: {str(e)}")
         return []
+
+def get_product_key_by_dept_code(db, dept_code):
+    """根据部门编码(dept_code)查询对应的product_key
+    
+    Args:
+        db: 数据库连接
+        dept_code: 部门编码
+    
+    Returns:
+        product_key列表或None
+    """
+    try:
+        cursor = db.cursor(dictionary=True)
+        query = """
+        SELECT product_key 
+        FROM iot_product_dept 
+        WHERE dept_code = %s
+        """
+        cursor.execute(query, (dept_code,))
+        results = cursor.fetchall()
+        cursor.close()
+        
+        if results:
+            # 返回所有找到的product_key列表
+            return [result['product_key'] for result in results]
+        else:
+            logger.warning(f"未找到部门编码对应的产品Key: dept_code={dept_code}")
+            return None
+    except Exception as e:
+        logger.error(f"查询部门对应产品Key失败: {str(e)}")
+        return None
 
 if __name__ == "__main__":
     main() 

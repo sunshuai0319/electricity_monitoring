@@ -56,7 +56,7 @@ CONFIG = {
         'expire_time': 86400 * 7 # 键过期时间，默认7天
     },
     'feishu': {
-        'webhook_url': 'https://open.feishu.cn/open-apis/bot/v2/hook/1f35ca70-1c95-43f4-a253-6d4eed59818e'
+        'webhook_url': 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxx'
     },
     'monitoring': {
         'check_interval_minutes': 30,
